@@ -8,8 +8,12 @@ public class LyraServerTarget : TargetRules
 	public LyraServerTarget(TargetInfo Target) : base(Target)
 	{
 		Type = TargetType.Server;
-		DefaultBuildSettings = BuildSettingsVersion.V5;
-		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_6;
-		ExtraModuleNames.Add("LyraGame");
+
+		ExtraModuleNames.AddRange(new string[] { "LyraGame" });
+		
+		LyraGameTarget.ApplySharedLyraTargetSettings(this);
+
+		//是否打开测试/发布版本的检查（断言）。
+		bUseChecksInShipping = true;
 	}
 }
