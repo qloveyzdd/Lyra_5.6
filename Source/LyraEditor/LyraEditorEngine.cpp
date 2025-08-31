@@ -2,10 +2,15 @@
 
 #include "LyraEditorEngine.h"
 
+#include "Framework/Notifications/NotificationManager.h"
+#include "GameModes/LyraWorldSettings.h"
 #include "Settings/ContentBrowserSettings.h"
+#include "Widgets/Notifications/SNotificationList.h"
+
+#define LOCTEXT_NAMESPACE "LyraEditor"
 
 ULyraEditorEngine::ULyraEditorEngine(const FObjectInitializer& ObjectInitializer)
-	:Super(ObjectInitializer)
+	: Super(ObjectInitializer)
 {
 }
 
@@ -26,11 +31,42 @@ void ULyraEditorEngine::Tick(float DeltaSeconds, bool bIdleMode)
 }
 
 FGameInstancePIEResult ULyraEditorEngine::PreCreatePIEInstances(const bool bAnyBlueprintErrors,
-	const bool bStartInSpectatorMode, const float PIEStartTime, const bool bSupportsOnlinePIE,
-	int32& InNumOnlinePIEInstances)
+                                                                const bool bStartInSpectatorMode,
+                                                                const float PIEStartTime, const bool bSupportsOnlinePIE,
+                                                                int32& InNumOnlinePIEInstances)
 {
-	return Super::PreCreatePIEInstances(bAnyBlueprintErrors, bStartInSpectatorMode, PIEStartTime, bSupportsOnlinePIE,
-	                                    InNumOnlinePIEInstances);
+	// 这段代码的目的是确保前端部分在编辑器中运行时使用独立网络模式，而不是其他网络模式（如客户端-服务器模式）。
+	// 如果检测到使用了非独立模式，它会显示一个通知，告知用户系统正在强制切换到独立模式。
+	if (const ALyraWorldSettings* LyraWorldSettings = Cast<ALyraWorldSettings>(EditorWorld->GetWorldSettings()))
+	{
+		if (LyraWorldSettings->ForceStandaloneNetMode)
+		{
+			//网络模式的枚举值
+			EPlayNetMode OutPlayNetMode;
+			// PlaySessionRequest（或完整名称可能是FRequestPlaySessionParams）是一个包含了启动游戏会话所需的各种参数和设置的结构体或类。
+			// 当你在虚幻编辑器中点击"Play"按钮时，引擎会创建一个这样的请求对象来配置游戏会话的运行方式。
+			PlaySessionRequest->EditorPlaySettings->GetPlayNetMode(OutPlayNetMode);
+			if (OutPlayNetMode != PIE_Standalone)
+			{
+				PlaySessionRequest->EditorPlaySettings->SetPlayNetMode(OutPlayNetMode);
+
+				// FNotificationInfo 是虚幻引擎(Unreal Engine)中用于创建和配置通知消息的类。
+				// 这些通知通常显示在编辑器界面的右下角，用于向用户提供各种信息、警告或错误消息。
+				// 创建了一个通知，内容为 "Forcing NetMode: Standalone for the Frontend"
+				// 设置通知显示时间为 2 秒
+				// 使用 FSlateNotificationManager 将通知添加到界面上显示
+				FNotificationInfo Info(LOCTEXT("ForcingStandaloneForFrontend",
+				                               "Forcing NetMode: Standalone for the Frontend"));
+				Info.ExpireDuration = 2.0f;
+				FSlateNotificationManager::Get().AddNotification(Info);
+			}
+		}
+	}
+
+	FGameInstancePIEResult Result = Super::PreCreatePIEInstances(bAnyBlueprintErrors, bStartInSpectatorMode,
+	                                                             PIEStartTime, bSupportsOnlinePIE,
+	                                                             InNumOnlinePIEInstances);
+	return Result;
 }
 
 void ULyraEditorEngine::FirstTickSetup()
@@ -38,7 +74,7 @@ void ULyraEditorEngine::FirstTickSetup()
 	if (bFirstTickSetup)return;
 
 	bFirstTickSetup = true;
-	
+
 	// 1. GetMutableDefault<UContentBrowserSettings>()
 	// GetMutableDefault<T>() 是虚幻引擎中的一个模板函数，用于获取指定UObject类型的默认对象的可修改引用。
 	// GetMutableDefault：获取可修改的默认对象实例
@@ -61,3 +97,6 @@ void ULyraEditorEngine::FirstTickSetup()
 	// 自己创建的插件内容
 	GetMutableDefault<UContentBrowserSettings>()->SetDisplayPluginFolders(true);
 }
+
+
+#undef LOCTEXT_NAMESPACE
