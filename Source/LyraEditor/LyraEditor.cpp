@@ -1,6 +1,8 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "LyraEditor.h"
+
+#include "GameModes/LyraExperienceManager.h"
 #include "Modules/ModuleManager.h"
 
 #define LOCTEXT_NAMESPACE "LyraEditor"
@@ -12,10 +14,26 @@ class FLyraEditorModule : public FDefaultGameModuleImpl
 {
 	virtual void StartupModule() override
 	{
+		if (!IsRunningGame())
+		{
+			FEditorDelegates::BeginPIE.AddRaw(this,&FLyraEditorModule::OnBeginPIE);
+			FEditorDelegates::EndPIE.AddRaw(this,&FLyraEditorModule::OnEndPIE);
+		}
 	}
 
 	virtual void ShutdownModule() override
 	{
+	}
+
+	void OnBeginPIE(bool bIsSimulating)
+	{
+		ULyraExperienceManager*ExperienceManager = GEngine->GetEngineSubsystem<ULyraExperienceManager>();
+		check(ExperienceManager);
+		ExperienceManager->OnPlayInEditorBegun();
+	}
+	void OnEndPIE(bool bIsSimulating)
+	{
+		
 	}
 };
 
