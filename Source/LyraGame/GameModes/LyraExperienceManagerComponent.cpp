@@ -2,10 +2,44 @@
 
 #include "LyraExperienceManagerComponent.h"
 
+#include "GameFeatureAction.h"
+#include "GameFeaturesSubsystem.h"
 #include "GameFeaturesSubsystemSettings.h"
 #include "LyraExperienceActionSet.h"
+#include "LyraExperienceManager.h"
 #include "LyraLogChannels.h"
 #include "Engine/AssetManager.h"
+#include "Net/UnrealNetwork.h"
+
+//这是一个测试Experience随机延迟的命令行参数，它可以通过命令行输入读取随机延迟时间的最小值与最大值，并通过这个GetExperienceLoadDelayDuration()去读取到一个随机测试值
+namespace LyraConsoleVariables
+{
+	static float ExperienceLoadRandomDelayMin = 0.0f;
+
+	static FAutoConsoleVariableRef CVarExperienceLoadRandomDelayMin(
+		TEXT("Lyra.chaos.ExperienceDelayLoad.MinSecs"),
+		ExperienceLoadRandomDelayMin,
+		TEXT(
+			"This value (in seconds) will be added as a delay of load completion of the experience (along with the random value lyra.chaos.ExperienceDelayLoad.RandomSecs"),
+		ECVF_Default
+	);
+
+	static float ExperienceLoadRandomDelayRange = 0.0f;
+
+	static FAutoConsoleVariableRef CVarExperienceLoadRandomDelayRange(
+		TEXT("Lyra.chaos.ExperienceDelayLoad.RandomSecs"),
+		ExperienceLoadRandomDelayRange,
+		TEXT(
+			"A random amount of time between 0 and this value (in seconds) will be added as a delay of load completion of the experience (along with the fixed value Lyra.chaos.ExperienceDelayLoad.MinSecs)"),
+		ECVF_Default
+	);
+
+	float GetExperienceLoadDelayDuration()
+	{
+		return FMath::Max(0.0f, ExperienceLoadRandomDelayMin + FMath::FRand() * ExperienceLoadRandomDelayRange);
+	}
+}
+
 
 ULyraExperienceManagerComponent::ULyraExperienceManagerComponent(const FObjectInitializer& InObjectInitializer)
 	: Super(InObjectInitializer)
@@ -14,9 +48,95 @@ ULyraExperienceManagerComponent::ULyraExperienceManagerComponent(const FObjectIn
 	SetIsReplicatedByDefault(true);
 }
 
+void ULyraExperienceManagerComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+	DOREPLIFETIME(ULyraExperienceManagerComponent, CurrentExperience);
+}
+
 void ULyraExperienceManagerComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	Super::EndPlay(EndPlayReason);
+
+	//恢复取消加载的任何功能设置
+
+	//关闭游戏特效插件
+	for (const FString& PluginURL : GameFeaturePluginURLs)
+	{
+		//通过我们写的引擎子系统来确认这个插件确实已经所有依赖释放完毕，最终释放这个插件
+		if (ULyraExperienceManager::RequestToDeactivatePlugin(PluginURL))
+		{
+			UGameFeaturesSubsystem::Get().DeactivateGameFeaturePlugin(PluginURL);
+		}
+	}
+
+	if (LoadState == ELyraExperienceLoadedState::Loaded)
+	{
+		LoadState = ELyraExperienceLoadedState::Deactivating;
+
+		//确保即便有人注册为暂停者但随即立刻执行操作，我们也不会过早完成转换过程
+		NumExpectedPausers = INDEX_NONE;
+		NumObservedPausers = 0;
+
+		//反激活并卸载这些操作
+
+		//在上下文中绑定Action结束时要进行的操作
+		FGameFeatureDeactivatingContext Context(
+			TEXT(""),
+			[this](FStringView)
+			{
+				this->OnActionDeactivationCompleted();
+			}
+		);
+
+		//制定上下文执行的世界
+		const FWorldContext* ExistingWorldContext = GEngine->GetWorldContextFromWorld(GetWorld());
+		if (ExistingWorldContext)
+		{
+			Context.SetRequiredWorldContextHandle(ExistingWorldContext->ContextHandle);
+		}
+
+		//取消Action的Lambda
+		auto DeactivateListOfActions = [&Context](const TArray<UGameFeatureAction*>& ActionList)
+		{
+			for (UGameFeatureAction* Action : ActionList)
+			{
+				if (Action)
+				{
+					Action->OnGameFeatureDeactivating(Context);
+					Action->OnGameFeatureUnregistering();
+				}
+			}
+		};
+
+		//取消Experience中的Actions
+		DeactivateListOfActions(CurrentExperience->Actions);
+
+		//取消Experience中的ActionSets的Action
+		for (const TObjectPtr<ULyraExperienceActionSet>& ActionSet : CurrentExperience->ActionSets)
+		{
+			if (ActionSet != nullptr)
+			{
+				DeactivateListOfActions(ActionSet->Actions);
+			}
+		}
+
+		NumExpectedPausers = Context.GetNumPausers();
+
+		//现在还不支持异步去取消这些操作，所以此处应该是0
+		if (NumExpectedPausers > 0)
+		{
+			UE_LOG(LogLyraExperience, Error,
+			       TEXT("Actions that have asynchronous deactivation aren't fully supported yet in Lyra experiences"));
+		}
+
+		//所有的Actions都已观测到取消，这里是同步的，所以会执行
+		if (NumExpectedPausers == NumObservedPausers)
+		{
+			OnAllActionsDeactivated();
+		}
+	}
 }
 
 bool ULyraExperienceManagerComponent::ShouldShowLoadingScreen(FString& OutReason) const
@@ -229,9 +349,10 @@ void ULyraExperienceManagerComponent::StartExperienceLoad()
 	}
 
 	//创建一个流式加载的代理
-	FStreamableDelegate OnAssetsLoadedDelegate = FStreamableDelegate::CreateUObject(this,&ULyraExperienceManagerComponent::OnExperienceLoadComplete);
+	FStreamableDelegate OnAssetsLoadedDelegate = FStreamableDelegate::CreateUObject(
+		this, &ULyraExperienceManagerComponent::OnExperienceLoadComplete);
 
-	if (!Handle.IsValid()||Handle->HasLoadCompleted())
+	if (!Handle.IsValid() || Handle->HasLoadCompleted())
 	{
 		// 资源已加载完成，现在调用委托函数即可
 		FStreamableHandle::ExecuteDelegate(OnAssetsLoadedDelegate);
@@ -247,7 +368,7 @@ void ULyraExperienceManagerComponent::StartExperienceLoad()
 			{
 				OnAssetsLoadedDelegate.ExecuteIfBound();
 			}
-			));
+		));
 	}
 
 	//这些资产会预先加载，但我们不会因此而阻止体验的开始
@@ -255,10 +376,183 @@ void ULyraExperienceManagerComponent::StartExperienceLoad()
 	//TODO:需要预先加载的资源（但是不需要进行阻塞式加载）
 	if (PreloadAssetList.Num() > 0)
 	{
-		AssetManager.ChangeBundleStateForPrimaryAssets(PreloadAssetList.Array(),BundlesToLoad,{});
+		AssetManager.ChangeBundleStateForPrimaryAssets(PreloadAssetList.Array(), BundlesToLoad, {});
 	}
 }
 
 void ULyraExperienceManagerComponent::OnExperienceLoadComplete()
 {
+	check(LoadState == ELyraExperienceLoadedState::Loading)
+
+	check(CurrentExperience != nullptr);
+
+	UE_LOG(LogLyraExperience, Log, TEXT("EXPERIENCE: OnExperienceLoadComplete(CurrentExperience = %s, %s)"),
+	       *CurrentExperience->GetPrimaryAssetId().ToString(), *GetClientServerContextString(this));
+
+	// 找出游戏功能插件网址，剔除重复项以及那些没有有效映射关系的网址
+	GameFeaturePluginURLs.Reset();
+
+	//搜集要使用的所有GameFeature插件
+	auto CollectGameFeaturePluginURLs = [this](const UPrimaryDataAsset* Context,
+	                                           const TArray<FString>& FeaturePluginList)
+	{
+		for (const FString& PluginName : FeaturePluginList)
+		{
+			FString PluginURL;
+			//需要对这些插件名字和URL进行验证，因为有可能写错插件名导致找不到
+			if (UGameFeaturesSubsystem::Get().GetPluginURLByName(PluginName,OUT PluginURL))
+			{
+				this->GameFeaturePluginURLs.AddUnique(PluginURL);
+			}
+			else
+			{
+				ensureMsgf(false,
+				           TEXT(
+					           "OnExperienceLoadComplete failed to find plugin URL from PluginName %s for experience %s - fix data, ignoring for this run"
+				           ), *PluginName, *Context->GetPrimaryAssetId().ToString());
+			}
+		}
+		//Add in our extra plugin
+	};
+
+	CollectGameFeaturePluginURLs(CurrentExperience, CurrentExperience->GameFeaturesToEnable);
+
+	//把ActionsSets中的每一个ActionSet对应的所有GameFeatures插件都填进去
+	for (const TObjectPtr<ULyraExperienceActionSet>& ActionSet : CurrentExperience->ActionSets)
+	{
+		if (ActionSet != nullptr)
+		{
+			CollectGameFeaturePluginURLs(ActionSet, ActionSet->GameFeaturesToEnable);
+		}
+	}
+
+	//加载并启用各项功能
+
+	//记录所有需要开启的游戏特性插件总数
+	NumGameFeaturePluginsLoading = GameFeaturePluginURLs.Num();
+
+	if (NumGameFeaturePluginsLoading > 0)
+	{
+		LoadState = ELyraExperienceLoadedState::LoadingGameFeatures;
+
+		for (const FString& PluginURL : GameFeaturePluginURLs)
+		{
+			//增加使用计数
+			ULyraExperienceManager::NotifyOfPluginActivation(PluginURL);
+
+			//激活该插件，在该插件激活完毕后触发是否Experience完全加载的判定
+			UGameFeaturesSubsystem::Get().LoadAndActivateGameFeaturePlugin(
+				PluginURL, FGameFeaturePluginLoadComplete::CreateUObject(
+					this, &ULyraExperienceManagerComponent::OnGameFeaturePluginLoadComplete));
+		}
+	}
+	else
+	{
+		//如果没有。直接调用Experience充分加载这个函数
+		OnExperienceFullloadCompleted();
+	}
+}
+
+void ULyraExperienceManagerComponent::OnGameFeaturePluginLoadComplete(const UE::GameFeatures::FResult& Result)
+{
+	//减少正在加载的插件数量
+	NumGameFeaturePluginsLoading--;
+
+	if (NumGameFeaturePluginsLoading == 0)
+	{
+		OnExperienceFullloadCompleted();
+	}
+}
+
+void ULyraExperienceManagerComponent::OnExperienceFullloadCompleted()
+{
+	check(LoadState == ELyraExperienceLoadedState::Loaded);
+
+	//(如果已经配置）插入一段随机延迟以进行测试
+	if (LoadState != ELyraExperienceLoadedState::LoadingChaosTestingDelay)
+	{
+		const float DelaySecs = LyraConsoleVariables::GetExperienceLoadDelayDuration();
+		if (DelaySecs > 0.0f)
+		{
+			FTimerHandle DummyHandle;
+
+			LoadState = ELyraExperienceLoadedState::LoadingChaosTestingDelay;
+			GetWorld()->GetTimerManager().SetTimer(DummyHandle, this,
+			                                       &ULyraExperienceManagerComponent::OnExperienceFullloadCompleted,
+			                                       DelaySecs,/*bLooping=*/false);
+			return;
+		}
+	}
+
+	//切换状态到执行Actions
+	LoadState = ELyraExperienceLoadedState::ExecutingActions;
+
+	//执行这些操作
+	FGameFeatureActivatingContext Context;
+
+	//只有在设置的情况下才适用于我们特定的环境背景
+	const FWorldContext* ExistingWorldContext = GEngine->GetWorldContextFromWorld(GetWorld());
+
+	if (ExistingWorldContext)
+	{
+		Context.SetRequiredWorldContextHandle(ExistingWorldContext->ContextHandle);
+	}
+
+	//执行Action操作的Lambda，需要提供一个世界的上下文
+	auto ActivateListOfActions = [&Context](const TArray<UGameFeatureAction*>& ActionList)
+	{
+		for (UGameFeatureAction* Action : ActionList)
+		{
+			//目前的这种行为与诸如游戏玩法标签这样的系统相匹配，在这些系统中，加载和注册操作适用于整个过程
+			//但实际上，将这些结果运用于演员这一环节却受到特定环境的限制
+			Action->OnGameFeatureRegistering();
+			Action->OnGameFeatureLoading();
+			Action->OnGameFeatureActivating(Context);
+		}
+	};
+
+	ActivateListOfActions(CurrentExperience->Actions);
+
+	//执行ActionSet的操作
+	for (const TObjectPtr<ULyraExperienceActionSet>& ActionSet : CurrentExperience->ActionSets)
+	{
+		if (ActionSet != nullptr)
+		{
+			ActivateListOfActions(ActionSet->Actions);
+		}
+	}
+
+	//到这里加载完成
+	LoadState = ELyraExperienceLoadedState::Loaded;
+
+	//呼叫执行各个级别的代理 这里通过优先级的控制 使得代理事件之间可以进行时序的区分
+	OnExperienceLoaded_HighPriority.Broadcast(CurrentExperience);
+	OnExperienceLoaded_HighPriority.Clear();
+
+	OnExperienceLoaded.Broadcast(CurrentExperience);
+	OnExperienceLoaded.Clear();
+
+	OnExperienceLoaded_LowPriority.Broadcast(CurrentExperience);
+	OnExperienceLoaded_LowPriority.Clear();
+
+	//应用任何必要的扩展性设置
+}
+
+void ULyraExperienceManagerComponent::OnActionDeactivationCompleted()
+{
+	//对于正在退出的Action进行计数
+	check(IsInGameThread());
+	++NumObservedPausers;
+	//所有的Action都已观测到取消，这里应该是异步的，但是代码给的日志，提示目前还不支持异步操作
+	if (NumObservedPausers == NumExpectedPausers)
+	{
+		OnAllActionsDeactivated();
+	}
+}
+
+void ULyraExperienceManagerComponent::OnAllActionsDeactivated()
+{
+	LoadState = ELyraExperienceLoadedState::Unloaded;
+
+	CurrentExperience = nullptr;
 }
