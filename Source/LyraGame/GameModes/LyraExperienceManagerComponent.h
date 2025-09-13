@@ -1,9 +1,12 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #pragma once
+#include "GameFeaturePluginOperationResult.h"
 #include "LoadingProcessInterface.h"
 #include "LyraExperienceDefinition.h"
 #include "Components/GameStateComponent.h"
+
+#include "LyraExperienceManagerComponent.generated.h"
 
 //Experience 各个阶段的加载代理，是一个多播
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnLyraExperienceLoaded, const ULyraExperienceDefinition* /*Experience*/)
@@ -63,9 +66,15 @@ private:
 
 	//开始加载
 	void StartExperienceLoad();
-
+	
 	//加载完成
 	void OnExperienceLoadComplete();
+
+	//当一个GameFeature插件加载完毕，从而减少需要加载GameFeature插件计数，在Experience加载过程中用于计数
+	void OnGameFeaturePluginLoadComplete(const UE::GameFeatures::FResult& Result);
+
+	//当Experience完全加载完毕后时，需要开启对应的Action列表，并在Action列表执行完毕后，启动之前注册的高中低优先级代理，最后重置用户设置
+	void OnExperienceFullloadCompleted();
 
 private:
 	//当前正在使用的体验

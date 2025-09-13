@@ -2,8 +2,10 @@
 
 #include "LyraExperienceManagerComponent.h"
 
+#include "GameFeaturesSubsystem.h"
 #include "GameFeaturesSubsystemSettings.h"
 #include "LyraExperienceActionSet.h"
+#include "LyraExperienceManager.h"
 #include "LyraLogChannels.h"
 #include "Engine/AssetManager.h"
 
@@ -229,9 +231,10 @@ void ULyraExperienceManagerComponent::StartExperienceLoad()
 	}
 
 	//创建一个流式加载的代理
-	FStreamableDelegate OnAssetsLoadedDelegate = FStreamableDelegate::CreateUObject(this,&ULyraExperienceManagerComponent::OnExperienceLoadComplete);
+	FStreamableDelegate OnAssetsLoadedDelegate = FStreamableDelegate::CreateUObject(
+		this, &ULyraExperienceManagerComponent::OnExperienceLoadComplete);
 
-	if (!Handle.IsValid()||Handle->HasLoadCompleted())
+	if (!Handle.IsValid() || Handle->HasLoadCompleted())
 	{
 		// 资源已加载完成，现在调用委托函数即可
 		FStreamableHandle::ExecuteDelegate(OnAssetsLoadedDelegate);
@@ -247,7 +250,7 @@ void ULyraExperienceManagerComponent::StartExperienceLoad()
 			{
 				OnAssetsLoadedDelegate.ExecuteIfBound();
 			}
-			));
+		));
 	}
 
 	//这些资产会预先加载，但我们不会因此而阻止体验的开始
@@ -255,10 +258,110 @@ void ULyraExperienceManagerComponent::StartExperienceLoad()
 	//TODO:需要预先加载的资源（但是不需要进行阻塞式加载）
 	if (PreloadAssetList.Num() > 0)
 	{
-		AssetManager.ChangeBundleStateForPrimaryAssets(PreloadAssetList.Array(),BundlesToLoad,{});
+		AssetManager.ChangeBundleStateForPrimaryAssets(PreloadAssetList.Array(), BundlesToLoad, {});
 	}
 }
 
 void ULyraExperienceManagerComponent::OnExperienceLoadComplete()
 {
+	check(LoadState == ELyraExperienceLoadedState::Loading)
+
+	check(CurrentExperience != nullptr);
+
+	UE_LOG(LogLyraExperience, Log, TEXT("EXPERIENCE: OnExperienceLoadComplete(CurrentExperience = %s, %s)"),
+	       *CurrentExperience->GetPrimaryAssetId().ToString(), *GetClientServerContextString(this));
+
+	// 找出游戏功能插件网址，剔除重复项以及那些没有有效映射关系的网址
+	GameFeaturePluginURLs.Reset();
+
+	//搜集要使用的所有GameFeature插件
+	auto CollectGameFeaturePluginURLs = [this](const UPrimaryDataAsset* Context,
+	                                           const TArray<FString>& FeaturePluginList)
+	{
+		for (const FString& PluginName : FeaturePluginList)
+		{
+			FString PluginURL;
+			//需要对这些插件名字和URL进行验证，因为有可能写错插件名导致找不到
+			if (UGameFeaturesSubsystem::Get().GetPluginURLByName(PluginName,OUT PluginURL))
+			{
+				this->GameFeaturePluginURLs.AddUnique(PluginURL);
+			}
+			else
+			{
+				ensure(false,
+				       TEXT(
+					       "OnExperienceLoadComplete failed to find plugin URL from PluginName %s for experience %s - fix data, ignoring for this run"
+				       ), *PluginName, *Context->GetPrimaryAssetId().ToString());
+			}
+		}
+		//Add in our extra plugin
+	};
+
+	CollectGameFeaturePluginURLs(CurrentExperience, CurrentExperience->GameFeaturesToEnable);
+
+	//把ActionsSets中的每一个ActionSet对应的所有GameFeatures插件都填进去
+	for (const TObjectPtr<ULyraExperienceActionSet>& ActionSet : CurrentExperience->ActionSets)
+	{
+		if (ActionSet != nullptr)
+		{
+			CollectGameFeaturePluginURLs(ActionSet, ActionSet->GameFeaturesToEnable);
+		}
+	}
+
+	//加载并启用各项功能
+
+	//记录所有需要开启的游戏特性插件总数
+	NumGameFeaturePluginsLoading = GameFeaturePluginURLs.Num();
+
+	if (NumGameFeaturePluginsLoading > 0)
+	{
+		LoadState = ELyraExperienceLoadedState::LoadingGameFeatures;
+
+		for (const FString& PluginURL : GameFeaturePluginURLs)
+		{
+			//增加使用计数
+			ULyraExperienceManager::NotifyOfPluginActivation(PluginURL);
+
+			//激活该插件，在该插件激活完毕后触发是否Experience完全加载的判定
+			UGameFeaturesSubsystem::Get().LoadAndActivateGameFeaturePlugin(
+				PluginURL, FGameFeaturePluginLoadComplete::CreateUObject(
+					this, &ULyraExperienceManagerComponent::OnGameFeaturePluginLoadComplete));
+		}
+	}
+	else
+	{
+		//如果没有。直接调用Experience充分加载这个函数
+		OnExperienceFullloadCompleted();
+	}
+}
+
+void ULyraExperienceManagerComponent::OnGameFeaturePluginLoadComplete(const UE::GameFeatures::FResult& Result)
+{
+	//减少正在加载的插件数量
+	NumGameFeaturePluginsLoading--;
+
+	if (NumGameFeaturePluginsLoading == 0)
+	{
+		OnExperienceFullloadCompleted();
+	}
+}
+
+void ULyraExperienceManagerComponent::OnExperienceFullloadCompleted()
+{
+	check(LoadState == ELyraExperienceLoadedState::Loaded);
+
+	//(如果已经配置）插入一段随机延迟以进行测试
+	if (LoadState != ELyraExperienceLoadedState::LoadingChaosTestingDelay)
+	{
+		const float DelaySecs = 0.1f;
+		if (DelaySecs > 0.0f)
+		{
+			FTimerHandle DummyHandle;
+
+			LoadState = ELyraExperienceLoadedState::LoadingChaosTestingDelay;
+			GetWorld()->GetTimerManager().SetTimer(DummyHandle, this,
+			                                       &ULyraExperienceManagerComponent::OnExperienceFullloadCompleted,
+			                                       DelaySecs,/*bLooping=*/false);
+		}
+	}
 }
