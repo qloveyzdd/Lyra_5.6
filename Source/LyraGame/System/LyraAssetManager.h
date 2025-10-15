@@ -34,6 +34,22 @@ public:
 	LYRAGAME_API const ULyraPawnData* GetDefaultPawnData() const;
 
 protected:
+	//获取或加载指定的游戏数据
+	template <typename GameDataClass>
+	const GameDataClass& GetOrLoadTypedGameData(const TSoftObjectPtr<GameDataClass>& DataPath)
+	{
+		//如果已经缓存了直接读取
+		if (const TObjectPtr<UPrimaryDataAsset>* pResult = GameDataMap.Find(GameDataClass::StaticClass()))
+		{
+			return *CastChecked<GameDataClass>(*pResult);
+		}
+		//如有需要则进行阻塞式加载
+		return *CastChecked<GameDataClass>(LoadGameDataOfClass(
+			GameDataClass::StaticClass(),
+			DataPath,
+			GameDataClass::StaticClass()->GetFName()));
+	}
+
 	//开始初始加载，由”初始化对象引用“函数调用
 	virtual void StartInitialLoading() override;
 
@@ -41,6 +57,12 @@ protected:
 #if WITH_EDITOR
 	LYRAGAME_API virtual void PreBeginPIE(bool bStartSimulate) override;
 #endif
+
+	//一种主要的资产类型，内部以FName格式表示，并且可以自动进行双向转换
+	//此设置的存在是为了让蓝图API能够明白者不是一个普通的FName类型
+	LYRAGAME_API UPrimaryDataAsset* LoadGameDataOfClass(TSubclassOf<UPrimaryDataAsset> DataClass,
+	                                                    const TSoftObjectPtr<UPrimaryDataAsset>& DataClassPath,
+	                                                    FPrimaryAssetType PrimaryAssetType);
 
 protected:
 	//所需的全局游戏数据资源
@@ -70,5 +92,5 @@ private:
 	LYRAGAME_API void UpdateInitialGameContentLoadPercent(float GameContentPercent);
 
 	//启动时要执行的任务列表，用于跟踪启动过程的进度。
-	TArray<class FLyraAssetManagerStartupJob> StartupJobs;
+	TArray<struct FLyraAssetManagerStartupJob> StartupJobs;
 };

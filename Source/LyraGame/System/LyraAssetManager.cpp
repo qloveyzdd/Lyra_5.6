@@ -5,6 +5,8 @@
 #include "LyraAssetManagerStartupJob.h"
 #include "LyraGameData.h"
 #include "LyraLogChannels.h"
+#include "Editor/Kismet/Internal/Blueprints/BlueprintDependencies.h"
+#include "EditorState/EditorState.h"
 
 //一个约定的Bundles的命名
 const FName FLyraBundles::Equipped("Equipped");
@@ -75,6 +77,81 @@ void ULyraAssetManager::StartInitialLoading()
 void ULyraAssetManager::PreBeginPIE(bool bStartSimulate)
 {
 	Super::PreBeginPIE(bStartSimulate);
+}
+
+UPrimaryDataAsset* ULyraAssetManager::LoadGameDataOfClass(TSubclassOf<UPrimaryDataAsset> DataClass,
+                                                          const TSoftObjectPtr<UPrimaryDataAsset>& DataClassPath,
+                                                          FPrimaryAssetType PrimaryAssetType)
+{
+	UPrimaryDataAsset* Asset = nullptr;
+
+	//用作性能分析
+	DECLARE_SCOPE_CYCLE_COUNTER(TEXT("Loading GameData Object"), STAT_GameDate, STATGROUP_LoadTime);
+
+	//加载路径不能为空
+	if (!DataClassPath.IsNull())
+	{
+#if WITH_EDITOR
+		//一个表示工作量的划分单元，该单元被划分为若干部分
+		//在每一个函数的顶部使用一个范围块，以便向缓慢操作的用户提供准确的进度反馈
+		FScopedSlowTask SlowTask(0, FText::Format(
+			                         NSLOCTEXT("LyraEditor", "BeginLoadingGameDataTask", "Loading GameData {0}"),
+			                         FText::FromName(DataClass->GetFName())));
+
+		const bool bShowCancelButton = false;
+
+		const bool bAllowInPIE = true;
+
+		SlowTask.MakeDialog(bShowCancelButton, bAllowInPIE);
+#endif
+
+		UE_LOG(LogLyra, Log, TEXT("Loading GameData: %s ..."), *DataClassPath.ToString());
+
+		//指定计时打印日志的宏
+		SCOPE_LOG_TIME_IN_SECONDS(TEXT("	... GameData loaded!"), nullptr);
+
+		//在编辑器中可以对该函数进行递归操作，因为它是根据需求从“PostLoad”阶段被调用的，所以在此情况下必须强制进行主资产的同步加载，并对其余部分进行异步加载。
+
+		if (GIsEditor)
+		{
+			//先加载主资产
+			Asset = DataClassPath.LoadSynchronous();
+
+			//加载指定类型的全部资源，适用于烘培操作
+			LoadPrimaryAssetsWithType(PrimaryAssetType);
+		}
+		else
+		{
+			TSharedPtr<FStreamableHandle> Handle = LoadPrimaryAssetsWithType(PrimaryAssetType);
+
+			if (Handle.IsValid())
+			{
+				//直到所需资源加载完成才会停止，这会将所请求的资源推至优先级列表的首位
+				//但不会清理所有异步加载操作，通常会比调用LoadObject函数完成的更快。
+				Handle->WaitUntilComplete(0.0f, false);
+
+				//返回所请求资产列表中的首个资产（若该资产已成功加载），若该资产加载失败，则此操作将失败
+				Asset = Cast<UPrimaryDataAsset>(Handle->GetLoadedAsset());
+			}
+		}
+	}
+
+	if (Asset)
+	{
+		//添加到缓存中 Key值是类类型 value值是指针
+		GameDataMap.Add(DataClass, Asset);
+	}
+	else
+	{
+		//任何游戏数据资产的加载都不得失败，否则将会导致一些不易诊断的软性故障
+		UE_LOG(LogLyra, Fatal,
+		       TEXT(
+			       "Failed to load GameData asset at %s. Type %s. This is not recoverable and likely means you do not have the correct data to run %s."
+		       ), *DataClassPath.ToString(), *PrimaryAssetType.ToString(), FApp::GetProjectName());
+	}
+
+
+	return Asset;
 }
 
 void ULyraAssetManager::DoAllStartupJobs()
@@ -169,5 +246,5 @@ void ULyraAssetManager::UpdateInitialGameContentLoadPercent(float GameContentPer
 
 const class ULyraGameData& ULyraAssetManager::GetGameData()
 {
-	return *NewObject<ULyraGameData>();
+	return GetOrLoadTypedGameData<ULyraGameData>(LyraGameDataPath);
 }
